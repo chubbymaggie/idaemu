@@ -4,9 +4,10 @@ from unicorn.x86_const import *
 from unicorn.arm_const import *
 from unicorn.arm64_const import *
 from struct import unpack, pack, unpack_from, calcsize
-from idaapi import get_func
-from idc import Qword, GetManyBytes, SelStart, SelEnd, here, ItemSize
-from idautils import XrefsTo
+import idc
+import idaapi
+import idautils
+import os
 
 PAGE_ALIGN = 0x1000  # 4k
 
@@ -20,6 +21,14 @@ TRACE_CODE = 4
 
 NO_EXTENSIONS = 0
 VFP_ENABLED = 1
+
+# support for old IDA versions
+if idaapi.IDA_SDK_VERSION < 700:
+    IDAAPI_GetBytes = idc.get_many_bytes
+    IDAAPI_get_qword = Qword
+else:
+    IDAAPI_GetBytes = idc.get_bytes
+    IDAAPI_get_qword = idc.get_qword
 
 class Emu(object):
     def __init__(self, arch, mode, compiler=COMPILE_GCC, stack=0xf000000, \
@@ -38,6 +47,7 @@ class Emu(object):
         self.extensionsSupport = NO_EXTENSIONS
         self.logBuffer = []
         self.altFunc = {}
+        self.disalePatchedBytes = False
         self._init()
 
     def _addTrace(self, logInfo):
@@ -97,14 +107,34 @@ class Emu(object):
     def _alignAddr(self, addr):
         return addr // PAGE_ALIGN * PAGE_ALIGN
 
+    def _bytes_unpatcher(self, ea, fpos, org_val, patch_val):
+        if fpos != -1:
+            if type(self.unp_tmp) == tuple:
+                self.unp_tmp[ea - self.unp_from_ea] = org_val
+            elif type(self.unp_tmp) == long:
+                shift = (ea - self.unp_from_ea) * 8
+                mask = ~(0xFF << shift)
+                self.unp_tmp = (self.unp_tmp  & mask) | (org_val << shift)
+
+    def _unpatch(self, from_ea, to_ea):
+        if self.disalePatchedBytes:
+            self.unp_from_ea = from_ea
+            idaapi.visit_patched_bytes(from_ea, to_ea, self._bytes_unpatcher)
+
+    def _get_unpatched_qword(self, ea):
+        self.unp_tmp = IDAAPI_get_qword(ea)
+        self._unpatch(ea, ea + 8)
+        return self.unp_tmp
+
     def _getOriginData(self, address, size):
         res = []
         for offset in xrange(0, size, 64):
-            tmp = GetManyBytes(address + offset, 64)
-            if tmp == None:
-                res.extend([pack("<Q", Qword(address + offset + i)) for i in range(0, 64, 8)])
+            self.unp_tmp = IDAAPI_GetBytes(address + offset, 64)
+            if self.unp_tmp == None:
+                res.extend([pack("<Q", self._get_unpatched_qword(address + offset + i)) for i in range(0, 64, 8)])
             else:
-                res.append(tmp)
+                self._unpatch(address + offset, address + offset + 64)
+                res.append(self.unp_tmp)
         res = "".join(res)
         return res[:size]
 
@@ -160,15 +190,16 @@ class Emu(object):
             self.REG_ARGS = [UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X2, UC_ARM64_REG_X3,
                              UC_ARM64_REG_X4, UC_ARM64_REG_X5, UC_ARM64_REG_X6, UC_ARM64_REG_X7]
 
-    def _initStackAndArgs(self, uc, RA, args):
+    def _initStackAndArgs(self, uc, RA, args, DisablePatchRA):
         uc.mem_map(self.stack, (self.ssize + 1) * PAGE_ALIGN)
         sp = self.stack + self.ssize * PAGE_ALIGN
         uc.reg_write(self.REG_SP, sp)
 
-        if self.REG_RA == 0:
-            uc.mem_write(sp, pack(self.pack_fmt, RA))
-        else:
-            uc.reg_write(self.REG_RA, RA)
+        if not DisablePatchRA:
+            if self.REG_RA == 0:
+                uc.mem_write(sp, pack(self.pack_fmt, RA))
+            else:
+                uc.reg_write(self.REG_RA, RA)
 
         ## init the arguments
         i = 0
@@ -339,26 +370,41 @@ class Emu(object):
         except UcError as e:
             print("#ERROR: %s" % e)
 
-    def _initData(self, uc):
+    def _initData(self):
         # data by values
         for address, data, init in self.data:
             addr = self._alignAddr(address)
             size = PAGE_ALIGN
             while size < len(data): size += PAGE_ALIGN
-            uc.mem_map(addr, size)
-            if init: uc.mem_write(addr, self._getOriginData(addr, size))
-            uc.mem_write(address, data)
+            self.curUC.mem_map(addr, size)
+            if init: self.curUC.mem_write(addr, self._getOriginData(addr, size))
+            self.curUC.mem_write(address, data)
         # data by memory dumps
-        for filename, address, size in self.dataFiles:
+        for filename, address, filesize in self.dataFiles:
+            # read data
             f = open(filename, "r+b")
             data = f.read()
+            # map data
+            addr = self._alignAddr(address)
+            size = PAGE_ALIGN
+            while addr + size < address + filesize: size += PAGE_ALIGN
+            self.curUC.mem_map(addr, size)
+            self.curUC.mem_write(address, data)
 
-    def _initRegs(self, uc):
+    def _initRegs(self):
         for reg, value in self.regs:
-            uc.reg_write(reg, value)
-        if self.arch == UC_ARCH_ARM64:
+            self.curUC.reg_write(reg, value)
+        if self.arch == UC_ARCH_ARM:
             if self.extensionsSupport & VFP_ENABLED:
-                uc.reg_write(UC_ARM64_REG_CPACR_EL1, (1 << 18) | (3 << 20))
+                regval = self.curUC.reg_read(UC_ARM_REG_C1_C0_2)
+                regval |= (0xF << 20)
+                self.curUC.reg_write(UC_ARM_REG_C1_C0_2, regval)
+                self.curUC.reg_write(UC_ARM_REG_FPEXC, 0x40000000)
+        elif self.arch == UC_ARCH_ARM64:
+            if self.extensionsSupport & VFP_ENABLED:
+                regval = self.curUC.reg_read(UC_ARM64_REG_CPACR_EL1)
+                regval |= (1 << 18) | (3 << 20)
+                self.curUC.reg_write(UC_ARM64_REG_CPACR_EL1, regval)
 
     def _initUnicorneUngine(self):
         if self.curUC:
@@ -368,10 +414,10 @@ class Emu(object):
         uc = Uc(self.arch, self.mode)
         self.curUC = uc
 
-        self._initData(uc)
-        self._initRegs(uc)
+        self._initData()
+        self._initRegs()
 
-    def _emulate(self, startAddr, stopAddr, args=[], TimeOut=0, Count=0):
+    def _emulate(self, startAddr, stopAddr, args=[], TimeOut=0, Count=0, DisablePatchRA=False):
         try:
             # reset trace buffer
             self.logBuffer = []
@@ -381,7 +427,7 @@ class Emu(object):
             uc = self.curUC
 
             # process arguments passing
-            self._initStackAndArgs(uc, stopAddr, args)
+            self._initStackAndArgs(uc, stopAddr, args, DisablePatchRA)
 
             # add the invalid memory access hook
             uc.hook_add(UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED | \
@@ -397,6 +443,16 @@ class Emu(object):
         except UcError as e:
             print("#ERROR: %s (PC = %x)" % (e, self.curUC.reg_read(self.REG_PC)))
 
+    def _is_thumb_ea(self, ea):
+        if idaapi.ph.id == idaapi.PLFM_ARM and not idaapi.ph.flag & idaapi.PR_USE64:
+            if idaapi.IDA_SDK_VERSION >= 700:
+                t = idc.get_sreg(ea, "T") # get T flag
+            else:
+                t = get_segreg(ea, 20) # get T flag
+            return t is not idc.BADSEL and t is not 0
+        else:
+            return False
+
     # force Unicorne object to be created before emulating,
     # e.g. to have abilty access data
     def silentStart(self):
@@ -411,8 +467,9 @@ class Emu(object):
         size = os.path.getsize(filename)
         if size == 0:
             print("file size is zero or file is not found")
-            return
+            return 0
         self.dataFiles.append((filename, base, size))
+        return size
 
     # set the data before emulation
     def setData(self, address, data, init=False):
@@ -450,17 +507,19 @@ class Emu(object):
     def getData(self, fmt, addr, count=1):
         if self.curUC == None:
             print("current uc is none.")
-            return
-        res = ''
-        if count > 1: res += '['
+            return None
+        dataSize = calcsize(fmt)
+        if dataSize == 0:
+            return None
+        if count == 1:
+            return unpack_from(fmt, self.curUC.mem_read(addr, dataSize))
+        res = '['
         for i in range(count):
-            dataSize = calcsize(fmt)
-            data = self.curUC.mem_read(addr + i * dataSize, dataSize)
-            if count > 1 and i < count - 1: res += '    '
-            st = unpack_from(fmt, data)
-            res += ''.join(st)
-            if count > 1 and i < count - 1: res += ','
-        res += ']' if count > 1 else ''
+            st = unpack_from(fmt, self.curUC.mem_read(addr + i * dataSize, dataSize))
+            if i < count - 1: res += ' ' * 4
+            res += ''.join(str(i) for i in st) if type(st) == tuple else ''.join(st)
+            if i < count - 1: res += ','
+        res += ']'
         return res
 
     def showData(self, fmt, addr, count=1):
@@ -468,6 +527,8 @@ class Emu(object):
             print("current uc is none.")
             return
         data = self.getData(fmt, addr, count)
+        if type(data) == tuple:
+            data = ''.join(data)
         print(data)
 
     def showDump(self, addr, count=1):
@@ -494,6 +555,9 @@ class Emu(object):
         else:
             self.extensionsSupport = VFP_ENABLED
 
+    def disablePatchedBytes(self, isDisable=True):
+        self.disalePatchedBytes = isDisable
+
     def showTrace(self):
         logs = "\n".join(self.logBuffer)
         print(logs)
@@ -507,28 +571,30 @@ class Emu(object):
         self.altFunc[address] = (func, argc, balance)
 
     def eFunc(self, address=None, retAddr=None, args=[], force=False):
-        if address == None: address = here()
-        func = get_func(address)
+        if address == None: address = idc.here()
+        func = idaapi.get_func(address)
         if retAddr == None:
-            refs = [ref.frm for ref in XrefsTo(func.start_ea, 0)]
+            refs = [ref.frm for ref in idautils.XrefsTo(func.start_ea, 0)]
             if len(refs) != 0:
-                retAddr = refs[0] + ItemSize(refs[0])
+                retAddr = refs[0] + idc.ItemSize(refs[0])
             else:
                 print("Please offer the return address.")
                 return
-        if force:
-            self._emulate(address, retAddr, args)
-        else:
-            self._emulate(func.start_ea, retAddr, args)
+        if not force:
+            address = func.start_ea
+        address = address | 1 if self._is_thumb_ea(address) else address
+        self._emulate(address, retAddr, args)
         res = self.curUC.reg_read(self.REG_RES)
         return res
 
     def eBlock(self, codeStart=None, codeEnd=None):
-        if codeStart == None: codeStart = SelStart()
-        if codeEnd == None: codeEnd = SelEnd()
-        self._emulate(codeStart, codeEnd)
+        if codeStart == None: codeStart = idc.SelStart()
+        if codeEnd == None: codeEnd = idc.SelEnd()
+        codeStart = codeStart | 1 if self._is_thumb_ea(codeStart) else codeStart
+        self._emulate(startAddr=codeStart, stopAddr=codeEnd, args=[], TimeOut=0, Count=0, DisablePatchRA=True)
         self._showRegs(self.curUC)
 
     def eUntilAddress(self, startAddr, stopAddr, args=[], TimeOut=0, Count=0):
-        self._emulate(startAddr=startAddr, stopAddr=stopAddr, args=args, TimeOut=TimeOut, Count=Count)
+        startAddr = startAddr | 1 if self._is_thumb_ea(startAddr) else startAddr
+        self._emulate(startAddr=startAddr, stopAddr=stopAddr, args=args, TimeOut=TimeOut, Count=Count, DisablePatchRA=True)
         self._showRegs(self.curUC)
